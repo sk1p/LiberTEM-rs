@@ -1168,6 +1168,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_logger"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85cdab6a89accf66733ad5a1693a4dcced6aeff64602b634530dd73c1f3ee9f0"
+dependencies = [
+ "humantime",
+ "is-terminal",
+ "log",
+ "regex",
+ "termcolor",
+]
+
+[[package]]
 name = "epaint"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1984,6 +1997,7 @@ dependencies = [
  "ipc-test",
  "itertools",
  "jemallocator",
+ "log",
  "memmap2",
  "ndarray",
  "ndarray-npy",
@@ -2006,8 +2020,10 @@ dependencies = [
  "bincode",
  "crossbeam",
  "crossbeam-channel",
+ "env_logger 0.10.0",
  "ipc-test",
  "k2o",
+ "log",
  "numpy",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -2054,7 +2070,7 @@ dependencies = [
  "bincode",
  "crossbeam",
  "crossbeam-channel",
- "env_logger",
+ "env_logger 0.9.3",
  "ipc-test",
  "log",
  "numpy",
@@ -2075,7 +2091,7 @@ dependencies = [
  "clap 3.2.23",
  "crossbeam",
  "crossbeam-channel",
- "env_logger",
+ "env_logger 0.9.3",
  "ipc-test",
  "log",
  "lz4",
@@ -2127,12 +2143,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.17"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abb12e687cfb44aa40f41fc3978ef76448f9b6038cad6aef4259d3c095a2382e"
-dependencies = [
- "cfg-if 1.0.0",
-]
+checksum = "518ef76f2f87365916b142844c16d8fefd85039bc5699050210a7778ee1cd1de"
 
 [[package]]
 name = "lz4"
