@@ -99,6 +99,26 @@ class SingleMaskUDF(ApplyMasksUDF):
         }
 
 
+class ResultTracker:
+    def __init__(self):
+        self._data = {}
+
+    def update_result(self, key, result):
+        self._data[key] = result
+
+    def get_result(self, key):
+        return self._data[key]
+
+    def remove_result(self, key):
+        del self._data[key]
+
+    def clear(self):
+        self._data = {}
+
+    def keys(self):
+        return list(self._data.keys())
+
+
 class WSServer:
     def __init__(self):
         self.connect()
@@ -110,6 +130,8 @@ class WSServer:
             'ro': 530.0,
         }
         self.udfs = self.get_udfs()
+        self.results = ResultTracker()
+        self.lock = asyncio.Lock()
 
     def get_udfs(self):
         cx = self.parameters['cx']
@@ -130,13 +152,16 @@ class WSServer:
         return OrderedDict({
             # "brightfield": SumSigUDF(),
             "annular": mask_udf,
+            # "annular1": mask_udf,
+            # "annular2": mask_udf,
+            # "annular3": mask_udf,
+            # "annular4": mask_udf,
             # "sum": SumUDF(),
             # "monitor": SignalMonitorUDF(),
             "monitor_partition": PartitionMonitorUDF(),
         })
 
     async def __call__(self, websocket: WebSocketServerProtocol):
-        await self.send_state_dump(websocket)
         await self.client_loop(websocket)
 
     async def send_state_dump(self, websocket: WebSocketClientProtocol):
@@ -144,6 +169,11 @@ class WSServer:
             'event': 'UPDATE_PARAMS',
             'parameters': self.parameters,
         }))
+        for key in self.results.keys():
+            result = self.results.get_result(key)
+            await self.handle_partial_result(
+                result, key, previous_results=None, dest=websocket
+            )
 
     def register_client(self, websocket):
         self.ws_connected.add(websocket)
@@ -153,9 +183,10 @@ class WSServer:
 
     async def client_loop(self, websocket: WebSocketClientProtocol):
         try:
-            self.register_client(websocket)
             try:
-                await self.send_state_dump(websocket)
+                async with self.lock:
+                    await self.send_state_dump(websocket)
+                    self.register_client(websocket)
                 async for msg in websocket:
                     await self.handle_message(msg, websocket)
             except websockets.exceptions.ConnectionClosedError:
@@ -262,9 +293,9 @@ class WSServer:
     async def handle_partial_result(
         self,
         partial_results: UDFResults,
-        pending_acq,
         acq_id: str,
-        previous_results: typing.Optional[UDFResults]
+        previous_results: typing.Optional[UDFResults],
+        dest: typing.Optional[WebSocketClientProtocol] = None,
     ):
         deltas = await self.make_deltas(partial_results, previous_results)
 
@@ -273,13 +304,14 @@ class WSServer:
             delta_results.append(
                 await self.encode_result(
                     delta['delta'],
-                    delta['udf_name'], 
+                    delta['udf_name'],
                     delta['channel_name']
                 )
             )
-        await self.broadcast(json.dumps({
+        header_msg = json.dumps({
             "event": "RESULT",
             "id": acq_id,
+            "timestamp": time.time(),
             "channels": [
                 {
                     "bbox": result.bbox,
@@ -292,9 +324,15 @@ class WSServer:
                 }
                 for result in delta_results
             ],
-        }))
+        })
+        if dest is None:
+            fn = self.broadcast
+        else:
+            fn = dest.send
+
+        await fn(header_msg)
         for result in delta_results:
-            await self.broadcast(result.compressed_data)
+            await fn(result.compressed_data)
 
     async def acquisition_loop(self):
         min_delta = 0.05
@@ -302,28 +340,42 @@ class WSServer:
             pending_aq = await sync_to_async(self.conn.wait_for_acquisition, timeout=10)
             if pending_aq is None:
                 continue
-            acq_id = await self.handle_pending_acquisition(pending_aq)
             try:
+                acq_id = await self.handle_pending_acquisition(pending_aq)
                 print(f"acquisition starting with id={acq_id}")
                 t0 = time.perf_counter()
+                num_updates = 0
                 previous_results = None
                 partial_results = None
                 side = int(math.sqrt(pending_aq.detector_config.get_num_frames()))
                 aq = self.ctx.make_acquisition(
                     conn=self.conn,
                     pending_aq=pending_aq,
-                    frames_per_partition=512,
+                    frames_per_partition=side,
                     nav_shape=(side, side),
                 )
                 last_update = 0
                 try:
                     udfs_only = list(self.udfs.values())
                     async for partial_results in self.ctx.run_udf_iter(dataset=aq, udf=udfs_only, sync=False):
+                        # XXX hacks: parameter update
+                        udfs_only = list(self.udfs.values())
+                        if self.ctx._runner._params._kwargs != [udf._kwargs for udf in udfs_only]:
+                            key = self.ctx._runner._params_handle
+                            self.ctx._runner._params.update_from_udfs(udfs_only)
+                            self.ctx.executor.scatter_update(key, self.ctx._runner._params)
+
                         if time.time() - last_update > min_delta:
-                            await self.handle_partial_result(partial_results, pending_aq, acq_id, previous_results)
+                            async with self.lock:
+                                await self.handle_partial_result(partial_results, acq_id, previous_results)
+                                self.results.update_result(acq_id, partial_results)
                             previous_results = copy.deepcopy(partial_results)
                             last_update = time.time()
-                    await self.handle_partial_result(partial_results, pending_aq, acq_id, previous_results)
+                            num_updates += 1
+                    async with self.lock:
+                        await self.handle_partial_result(partial_results, acq_id, previous_results)
+                        self.results.update_result(acq_id, partial_results)
+                    num_updates += 1
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -333,9 +385,11 @@ class WSServer:
                 previous_results = copy.deepcopy(partial_results)
             finally:
                 await self.handle_acquisition_end(pending_aq, acq_id)
+                self.results.clear()
             previous_results = None
             t1 = time.perf_counter()
-            print(f"acquisition done with id={acq_id}; took {t1-t0:.3f}s")
+            print(f"acquisition done with id={acq_id}; took {t1-t0:.3f}s; num_updates={num_updates}")
+            num_updates = 0
 
     async def serve(self):
         async with websockets.serve(self, "localhost", 8444):
