@@ -3,6 +3,7 @@ import json
 import asyncio
 import typing
 import copy
+import logging
 from collections import OrderedDict
 
 import numba
@@ -25,9 +26,12 @@ from libertem_live.udf.monitor import (
 
 from libertem.udf.base import UDFResults, UDF
 from libertem.common.async_utils import sync_to_async
+from libertem.common.executor import JobCancelledError
 
 if typing.TYPE_CHECKING:
     from libertem.common.executor import JobExecutor
+
+logger = logging.getLogger(__name__)
 
 
 class EncodedResult:
@@ -198,14 +202,14 @@ class WSServer:
             msg = json.loads(msg)
             # FIXME: hack to not require the 'event' "tag":
             if 'event' not in msg or msg['event'] == 'UPDATE_PARAMS':
-                print(f"parameter update: {msg}")
+                logger.info(f"parameter update: {msg}")
                 self.parameters = msg['parameters']
                 self.udfs = self.get_udfs()
                 # broadcast to all clients:
                 msg['event'] = 'UPDATE_PARAMS'
                 await self.broadcast(json.dumps(msg))
         except Exception as e:
-            print(e)
+            logging.exception('Error broadcasting message', e)
 
     async def broadcast(self, msg):
         websockets.broadcast(self.ws_connected, msg)
@@ -238,7 +242,7 @@ class WSServer:
         nonzero_mask = ~np.isclose(0, delta)
 
         if np.count_nonzero(nonzero_mask) == 0:
-            print(f"zero-delta update, skipping")
+            logger.debug("zero-delta update, skipping")
             # skip this update if it is all-zero
             return EncodedResult(
                 compressed_data=memoryview(b""),
@@ -253,7 +257,7 @@ class WSServer:
         bbox = get_bbox(delta)
         ymin, ymax, xmin, xmax = bbox
         delta_for_blit = delta[ymin:ymax + 1, xmin:xmax + 1]
-        # print(delta_for_blit.shape, delta_for_blit, list(delta_for_blit[-1]))
+        # logger.debug(delta_for_blit.shape, delta_for_blit, list(delta_for_blit[-1]))
 
         # FIXME: remove allocating copy - maybe copy into pre-allocated buffer instead?
         # compressed = await sync_to_async(lambda: lz4.frame.compress(np.copy(delta_for_blit)))
@@ -341,7 +345,7 @@ class WSServer:
                 continue
             try:
                 acq_id = await self.handle_pending_acquisition(pending_aq)
-                print(f"acquisition starting with id={acq_id}")
+                logger.info(f"acquisition starting with id={acq_id}")
                 t0 = time.perf_counter()
                 num_updates = 0
                 previous_results = None
@@ -373,6 +377,10 @@ class WSServer:
                         await self.handle_partial_result(partial_results, acq_id, previous_results)
                         self.results.update_result(acq_id, partial_results)
                     num_updates += 1
+                except JobCancelledError:
+                    logger.warning(
+                        "job was cancelled - continuing with the existing connection"
+                    )
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -385,7 +393,7 @@ class WSServer:
                 self.results.clear()
             previous_results = None
             t1 = time.perf_counter()
-            print(f"acquisition done with id={acq_id}; took {t1-t0:.3f}s; num_updates={num_updates}")
+            logger.info(f"acquisition done with id={acq_id}; took {t1-t0:.3f}s; num_updates={num_updates}")
             num_updates = 0
 
     async def serve(self):
@@ -423,5 +431,5 @@ async def main():
 
 
 if __name__ == "__main__":
-
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())

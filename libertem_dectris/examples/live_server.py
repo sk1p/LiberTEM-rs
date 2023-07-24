@@ -18,6 +18,8 @@ from libertem import masks
 from libertem.udf.sum import SumUDF
 from libertem.udf.sumsigudf import SumSigUDF
 from libertem.udf.masks import ApplyMasksUDF
+from libertem.udf.com import COMParams
+from libertem_icom.udf.icom import ICOMUDF
 from libertem.executor.pipelined import PipelinedExecutor
 from libertem_live.api import LiveContext
 from libertem_live.udf.monitor import (
@@ -149,9 +151,12 @@ class WSServer:
                 radius_inner=ri)
 
         mask_udf = SingleMaskUDF(mask_factories=[_ring])
+        params = COMParams(cy=cy, cx=cx, r=ro, ri=ri)
+        icom_udf = ICOMUDF(params)
         return OrderedDict({
             # "brightfield": SumSigUDF(),
-            "annular": mask_udf,
+            # "annular": mask_udf,
+            "icom": icom_udf,
             # "annular1": mask_udf,
             # "annular2": mask_udf,
             # "annular3": mask_udf,
@@ -218,6 +223,9 @@ class WSServer:
             udf_name = udf_names[idx]
             for channel_name in partial_results.buffers[idx].keys():
                 data = partial_results.buffers[idx][channel_name].data
+                # FIXME implement n-dimnsional result buffers
+                if len(data.shape) != 2:
+                    continue
                 if previous_results is None:
                     data_previous = np.zeros_like(data)
                 else:
@@ -402,7 +410,7 @@ class WSServer:
     def connect(self):
         executor = PipelinedExecutor(
             spec=PipelinedExecutor.make_spec(
-                cpus=range(20), cudas=[]
+                cpus=range(24), cudas=[]
             ),
             pin_workers=False,
         )
