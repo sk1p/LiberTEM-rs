@@ -2004,6 +2004,7 @@ dependencies = [
  "crossbeam",
  "crossbeam-channel",
  "dbus",
+ "env_logger 0.10.0",
  "hdf5",
  "human_bytes",
  "ipc-test",
