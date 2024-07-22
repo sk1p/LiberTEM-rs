@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    background_thread::{ReceiverStatus, ResultMsg, TPXReceiver},
+    background_thread::{ReceiverStatus, TPXReceiver, TPXReceiverMsg},
     cam_client::CamClient,
     chunk_stack::ChunkStackHandle,
     exceptions::{ConnectionError, TimeoutError},
@@ -122,7 +122,7 @@ impl<'a, 'b, 'c, 'd> ChunkIterator<'a, 'b, 'c, 'd> {
             py.check_signals()?;
 
             let recv_result = py.allow_threads(|| {
-                let next: Result<Option<ResultMsg>, Infallible> =
+                let next: Result<Option<TPXReceiverMsg>, Infallible> =
                     Ok(recv.next_timeout(Duration::from_millis(100)));
                 next
             })?;
@@ -131,31 +131,31 @@ impl<'a, 'b, 'c, 'd> ChunkIterator<'a, 'b, 'c, 'd> {
                 None => {
                     continue;
                 }
-                Some(ResultMsg::AcquisitionStart { header: _ }) => {
+                Some(TPXReceiverMsg::AcquisitionStart { header: _ }) => {
                     // FIXME: in case of "passive" mode, we should actually not hit this,
                     // as the "outer" structure (`*Connection`) handles it?
                     continue;
                 }
-                Some(ResultMsg::ScanStart { header: _ }) => {
+                Some(TPXReceiverMsg::ScanStart { header: _ }) => {
                     continue;
                 }
-                Some(ResultMsg::SerdeError { msg, recvd_msg }) => {
+                Some(TPXReceiverMsg::SerdeError { msg, recvd_msg }) => {
                     return Err(exceptions::PyRuntimeError::new_err(format!(
                         "serialization error: {msg}, message: {recvd_msg}",
                     )))
                 }
-                Some(ResultMsg::AcquisitionError { msg }) => {
+                Some(TPXReceiverMsg::AcquisitionError { msg }) => {
                     return Err(exceptions::PyRuntimeError::new_err(msg))
                 }
-                Some(ResultMsg::ReceiverError { msg }) => {
+                Some(TPXReceiverMsg::ReceiverError { msg }) => {
                     return Err(exceptions::PyRuntimeError::new_err(msg))
                 }
-                Some(ResultMsg::End { frame_stack }) => {
+                Some(TPXReceiverMsg::End { frame_stack }) => {
                     self.stats.log_stats();
                     self.stats.reset();
                     return Ok(Some(frame_stack));
                 }
-                Some(ResultMsg::FrameStack { frame_stack }) => {
+                Some(TPXReceiverMsg::FrameStack { frame_stack }) => {
                     return Ok(Some(frame_stack));
                 }
             }
@@ -258,25 +258,27 @@ impl ASITpx3Connection {
             });
 
             match res {
-                Some(ResultMsg::AcquisitionStart {
-                    header,
-                    // }) => return Ok(Some(header)),
+                Some(TPXReceiverMsg::AcquisitionStart {
+                    pending_acquisition, // }) => return Ok(Some(header)),
                 }) => {
-                    trace!("got ResultMsg::AcquisitionStart");
-                    return Ok(Some(header));
+                    trace!("got TPXReceiverMsg::AcquisitionStart");
+                    return Ok(Some(pending_acquisition));
                 }
-                msg @ Some(ResultMsg::FrameStack { .. }) | msg @ Some(ResultMsg::End { .. }) => {
+                msg @ Some(TPXReceiverMsg::FrameStack { .. })
+                | msg @ Some(TPXReceiverMsg::End { .. }) => {
                     warn!("discarding unexpected message {msg:?}");
                     continue;
                 }
-                Some(ResultMsg::ScanStart { header: _ }) => {
+                Some(TPXReceiverMsg::ScanStart { header: _ }) => {
                     todo!("what do we do here?");
                 }
-                Some(ResultMsg::ReceiverError { msg }) => return Err(PyRuntimeError::new_err(msg)),
-                Some(ResultMsg::AcquisitionError { msg }) => {
+                Some(TPXReceiverMsg::ReceiverError { msg }) => {
                     return Err(PyRuntimeError::new_err(msg))
                 }
-                Some(ResultMsg::SerdeError { msg, recvd_msg: _ }) => {
+                Some(TPXReceiverMsg::AcquisitionError { msg }) => {
+                    return Err(PyRuntimeError::new_err(msg))
+                }
+                Some(TPXReceiverMsg::SerdeError { msg, recvd_msg: _ }) => {
                     return Err(PyRuntimeError::new_err(msg))
                 }
                 None => {

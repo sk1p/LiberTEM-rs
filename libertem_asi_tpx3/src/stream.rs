@@ -1,4 +1,4 @@
-use std::net::TcpStream;
+use std::{net::TcpStream, rc::Rc};
 
 use common::tcp::{read_exact_interruptible, ReadExactError};
 

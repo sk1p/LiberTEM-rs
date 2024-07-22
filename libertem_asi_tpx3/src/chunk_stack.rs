@@ -1,4 +1,5 @@
 use bincode::serialize;
+use common::frame_stack::FrameMeta;
 use ipc_test::{SharedSlabAllocator, Slot, SlotForWriting, SlotInfo};
 use log::trace;
 use pyo3::{
@@ -211,6 +212,25 @@ impl ChunkStackForWriting {
             total_bytes_used: self.cursor,
             total_bytes_padding: self.padding_bytes,
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TPXFrameMeta {
+    layout: ChunkCSRLayout,
+}
+
+impl FrameMeta for TPXFrameMeta {
+    fn get_data_length_bytes(&self) -> usize {
+        self.layout.data_length_bytes
+    }
+
+    fn get_dtype_string(&self) -> String {
+        self.layout.get_value_dtype()
+    }
+
+    fn get_shape(&self) -> (u64, u64) {
+        todo!("TPXFrameMeta.get_shape")
     }
 }
 

@@ -1,4 +1,5 @@
 use bincode::{ErrorKind, Options};
+use common::generic_connection::AcquisitionConfig;
 use pyo3::pyclass;
 use serde::{Deserialize, Serialize};
 
@@ -196,6 +197,12 @@ impl AcquisitionStart {
             sequence,
             reserved: [0; 15],
         }
+    }
+}
+
+impl AcquisitionConfig for AcquisitionStart {
+    fn num_frames(&self) -> usize {
+        self.nav_shape.0 as usize * self.nav_shape.1 as usize
     }
 }
 

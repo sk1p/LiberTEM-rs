@@ -2,62 +2,27 @@ use std::{
     fmt::Display,
     mem::replace,
     net::TcpStream,
+    sync::mpsc::{channel, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError};
+use common::{
+    background_thread::{BackgroundThread, ControlMsg, ReceiverMsg},
+    generic_connection::{AcquisitionConfig, GenericConnection},
+};
 use ipc_test::{SHMHandle, SharedSlabAllocator};
 use log::{debug, error, info, trace, warn};
 
 use crate::{
-    chunk_stack::{ChunkCSRLayout, ChunkStackForWriting, ChunkStackHandle},
+    chunk_stack::{ChunkCSRLayout, ChunkStackForWriting, ChunkStackHandle, TPXFrameMeta},
     csr_view_raw::CSRViewRaw,
     headers::{AcquisitionEnd, AcquisitionStart, HeaderTypes, ScanEnd, ScanStart},
     stream::{stream_recv_chunk, stream_recv_header, StreamError},
 };
 
-///
-#[derive(PartialEq, Eq, Debug)]
-pub enum ResultMsg {
-    SerdeError {
-        msg: String,
-        recvd_msg: String,
-    },
-    AcquisitionStart {
-        header: AcquisitionStart,
-    },
-
-    /// An error bubbled up and the background thread was terminated:
-    ReceiverError {
-        msg: String,
-    },
-
-    /// An error happened while the acquisition was running, probably need to
-    /// inform upstream users...
-    /// (the background thread is still running, though, and reconnecting to the data source)
-    AcquisitionError {
-        msg: String,
-    },
-
-    ScanStart {
-        header: ScanStart,
-    },
-    FrameStack {
-        frame_stack: ChunkStackHandle,
-    },
-    End {
-        frame_stack: ChunkStackHandle,
-    },
-}
-
-pub enum ControlMsg {
-    StopThread,
-
-    /// Wait for `AcquisitionStart` / `ScanStart` messages and latch onto acquisitions,
-    /// until the background thread is stopped.
-    StartAcquisitionPassive,
-}
+pub type TPXControlMsg = ControlMsg<()>;
+pub type TPXReceiverMsg = ReceiverMsg<TPXFrameMeta, AcquisitionStart>;
 
 #[derive(PartialEq, Eq)]
 pub enum ReceiverStatus {
@@ -66,7 +31,7 @@ pub enum ReceiverStatus {
     Closed,
 }
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 enum AcquisitionError {
     Disconnected,
     Cancelled,
@@ -127,31 +92,19 @@ impl Display for AcquisitionError {
     }
 }
 
-#[derive(Debug)]
-pub enum ControlError {
-    Cancelled,
-    StateError { msg: String },
-}
-
-impl From<ControlError> for AcquisitionError {
-    fn from(value: ControlError) -> Self {
-        match value {
-            ControlError::Cancelled => AcquisitionError::Cancelled,
-            ControlError::StateError { msg } => AcquisitionError::StateError { msg },
-        }
-    }
-}
-
 /// With a running acquisition, check for control messages;
 /// especially convert `ControlMsg::StopThread` to `AcquisitionError::Cancelled`.
-fn check_for_control(control_channel: &Receiver<ControlMsg>) -> Result<(), ControlError> {
+fn check_for_control(control_channel: &Receiver<TPXControlMsg>) -> Result<(), AcquisitionError> {
     match control_channel.try_recv() {
-        Ok(ControlMsg::StartAcquisitionPassive) => Err(ControlError::StateError {
+        Ok(TPXControlMsg::StartAcquisitionPassive) => Err(AcquisitionError::StateError {
             msg: "received StartAcquisitionPassive while an acquisition was already running"
-                .to_string(),
+                .to_owned(),
         }),
-        Ok(ControlMsg::StopThread) => Err(ControlError::Cancelled),
-        Err(TryRecvError::Disconnected) => Err(ControlError::Cancelled),
+        Ok(TPXControlMsg::StopThread) => Err(AcquisitionError::Cancelled),
+        Ok(TPXControlMsg::SpecializedControlMsg { msg }) => Err(AcquisitionError::StateError {
+            msg: format!("received unknowen SpecializedControlMsg: {msg:?}").to_owned(),
+        }),
+        Err(TryRecvError::Disconnected) => Err(AcquisitionError::Cancelled),
         Err(TryRecvError::Empty) => Ok(()),
     }
 }
@@ -159,8 +112,8 @@ fn check_for_control(control_channel: &Receiver<ControlMsg>) -> Result<(), Contr
 /// Passively listen for global acquisition and scan headers
 /// and automatically latch on to them.
 fn wait_for_acquisition(
-    control_channel: &Receiver<ControlMsg>,
-    from_thread_s: &Sender<ResultMsg>,
+    control_channel: &Receiver<TPXControlMsg>,
+    from_thread_s: &Sender<TPXReceiverMsg>,
     stream: &mut TcpStream,
     frame_stack_size: usize,
     shm: &mut SharedSlabAllocator,
@@ -193,7 +146,7 @@ fn wait_for_acquisition(
                     Err(e) => {
                         let msg = format!("Error while an acquisition was running: {e:?}");
                         from_thread_s
-                            .send(ResultMsg::AcquisitionError { msg })
+                            .send(TPXReceiverMsg::FatalError { error: Box::new(e) })
                             .unwrap();
                         return Err(e);
                     }
@@ -218,8 +171,8 @@ fn wait_for_acquisition(
 
 fn wait_for_scan(
     acquisition_header: AcquisitionStart,
-    control_channel: &Receiver<ControlMsg>,
-    from_thread_s: &Sender<ResultMsg>,
+    control_channel: &Receiver<TPXControlMsg>,
+    from_thread_s: &Sender<TPXReceiverMsg>,
     stream: &mut TcpStream,
     frame_stack_size: usize,
     shm: &mut SharedSlabAllocator,
@@ -297,8 +250,8 @@ enum ScanResult {
 fn handle_scan(
     acquisition_header: AcquisitionStart,
     _scan_header: ScanStart,
-    to_thread_r: &Receiver<ControlMsg>,
-    from_thread_s: &Sender<ResultMsg>,
+    to_thread_r: &Receiver<TPXControlMsg>,
+    from_thread_s: &Sender<TPXReceiverMsg>,
     stream: &mut TcpStream,
     chunks_per_stack: usize,
     shm: &mut SharedSlabAllocator,
@@ -306,9 +259,9 @@ fn handle_scan(
     let t0 = Instant::now();
     let mut last_control_check = Instant::now();
 
-    trace!("sending ResultMsg::AcquisitionStart message");
-    from_thread_s.send(ResultMsg::AcquisitionStart {
-        header: acquisition_header.clone(),
+    trace!("sending TPXReceiverMsg::AcquisitionStart message");
+    from_thread_s.send(TPXReceiverMsg::AcquisitionStart {
+        pending_acquisition: acquisition_header.clone(),
     })?;
 
     let slot = match shm.get_mut() {
@@ -363,7 +316,7 @@ fn handle_scan(
                     //     handle.get_chunk_views_raw(&slot_r);
                     // }
 
-                    from_thread_s.send(ResultMsg::FrameStack {
+                    from_thread_s.send(TPXReceiverMsg::FrameStack {
                         frame_stack: handle,
                     })?;
                 }
@@ -395,7 +348,7 @@ fn handle_scan(
                 info!("scan done in {elapsed:?}",);
 
                 let handle = chunk_stack.writing_done(shm);
-                from_thread_s.send(ResultMsg::End {
+                from_thread_s.send(TPXReceiverMsg::End {
                     frame_stack: handle,
                 })?;
                 return Ok(ScanResult::ScanDone(header));
@@ -405,7 +358,7 @@ fn handle_scan(
                 warn!("AcquisitionEnd after {elapsed:?} - probably cancelled?",);
                 let handle = chunk_stack.writing_done(shm);
                 // FIXME: send a different result message in this case?
-                from_thread_s.send(ResultMsg::End {
+                from_thread_s.send(TPXReceiverMsg::Finished {
                     frame_stack: handle,
                 })?;
                 return Ok(ScanResult::ScanCancelled(header));
@@ -420,8 +373,8 @@ fn handle_scan(
 
 /// convert `AcquisitionError`s to messages on `from_threads_s`
 fn background_thread_wrap(
-    to_thread_r: &Receiver<ControlMsg>,
-    from_thread_s: &Sender<ResultMsg>,
+    to_thread_r: &Receiver<TPXControlMsg>,
+    from_thread_s: &Sender<TPXReceiverMsg>,
     uri: &str,
     frame_stack_size: usize,
     shm: SharedSlabAllocator,
@@ -431,8 +384,8 @@ fn background_thread_wrap(
         // NOTE: `shm` is dropped in case of an error, so anyone who tries to connect afterwards
         // will get an error
         from_thread_s
-            .send(ResultMsg::ReceiverError {
-                msg: err.to_string(),
+            .send(TPXReceiverMsg::FatalError {
+                error: Box::new(err),
             })
             .unwrap();
     }
@@ -456,8 +409,8 @@ fn make_stream(remote: &str) -> Option<TcpStream> {
 }
 
 fn passive_loop(
-    to_thread_r: &Receiver<ControlMsg>,
-    from_thread_s: &Sender<ResultMsg>,
+    to_thread_r: &Receiver<TPXControlMsg>,
+    from_thread_s: &Sender<TPXReceiverMsg>,
     remote: &str,
     frame_stack_size: usize,
     shm: &mut SharedSlabAllocator,
@@ -506,8 +459,8 @@ fn passive_loop(
 }
 
 fn background_thread(
-    to_thread_r: &Receiver<ControlMsg>,
-    from_thread_s: &Sender<ResultMsg>,
+    to_thread_r: &Receiver<TPXControlMsg>,
+    from_thread_s: &Sender<TPXReceiverMsg>,
     remote: &str,
     frame_stack_size: usize,
     mut shm: SharedSlabAllocator,
@@ -516,7 +469,7 @@ fn background_thread(
         // control: main threads tells us to start or quit
         let control = to_thread_r.recv_timeout(Duration::from_millis(100));
         match control {
-            Ok(ControlMsg::StartAcquisitionPassive) => {
+            Ok(TPXControlMsg::StartAcquisitionPassive) => {
                 match passive_loop(
                     to_thread_r,
                     from_thread_s,
@@ -532,8 +485,12 @@ fn background_thread(
                     e @ Err(_) => return e,
                 }
             }
-            Ok(ControlMsg::StopThread) => {
+            Ok(TPXControlMsg::StopThread) => {
                 debug!("background_thread: got a StopThread message");
+                break;
+            }
+            Ok(TPXControlMsg::SpecializedControlMsg { msg }) => {
+                error!("unexpected SpecializedControlMsg: {msg:?}");
                 break;
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -562,16 +519,16 @@ impl Display for ReceiverError {
 /// puts it into shared memory.
 pub struct TPXReceiver {
     bg_thread: Option<JoinHandle<()>>,
-    to_thread: Sender<ControlMsg>,
-    from_thread: Receiver<ResultMsg>,
+    to_thread: Sender<TPXControlMsg>,
+    from_thread: Receiver<TPXReceiverMsg>,
     pub status: ReceiverStatus,
     pub shm_handle: SHMHandle,
 }
 
 impl TPXReceiver {
     pub fn new(uri: &str, frame_stack_size: usize, shm: SharedSlabAllocator) -> Self {
-        let (to_thread_s, to_thread_r) = unbounded();
-        let (from_thread_s, from_thread_r) = unbounded();
+        let (to_thread_s, to_thread_r) = channel();
+        let (from_thread_s, from_thread_r) = channel();
 
         let builder = std::thread::Builder::new();
         let uri = uri.to_string();
@@ -600,19 +557,19 @@ impl TPXReceiver {
         }
     }
 
-    fn adjust_status(&mut self, msg: &ResultMsg) {
+    fn adjust_status(&mut self, msg: &TPXReceiverMsg) {
         match msg {
-            ResultMsg::AcquisitionStart { .. } => {
+            TPXReceiverMsg::AcquisitionStart { .. } => {
                 self.status = ReceiverStatus::Running;
             }
-            ResultMsg::End { .. } => {
+            TPXReceiverMsg::Finished { .. } => {
                 self.status = ReceiverStatus::Idle;
             }
             _ => {}
         }
     }
 
-    pub fn recv(&mut self) -> ResultMsg {
+    pub fn recv(&mut self) -> TPXReceiverMsg {
         let result_msg = self
             .from_thread
             .recv()
@@ -621,7 +578,7 @@ impl TPXReceiver {
         result_msg
     }
 
-    pub fn next_timeout(&mut self, timeout: Duration) -> Option<ResultMsg> {
+    pub fn next_timeout(&mut self, timeout: Duration) -> Option<TPXReceiverMsg> {
         let result_msg = self.from_thread.recv_timeout(timeout);
 
         match result_msg {
@@ -645,14 +602,14 @@ impl TPXReceiver {
             });
         }
         self.to_thread
-            .send(ControlMsg::StartAcquisitionPassive)
+            .send(TPXControlMsg::StartAcquisitionPassive)
             .expect("background thread should be running");
         self.status = ReceiverStatus::Running;
         Ok(())
     }
 
     pub fn close(&mut self) {
-        if self.to_thread.send(ControlMsg::StopThread).is_err() {
+        if self.to_thread.send(TPXControlMsg::StopThread).is_err() {
             warn!("could not stop background thread, probably already dead");
         }
         if let Some(join_handle) = self.bg_thread.take() {
@@ -663,5 +620,55 @@ impl TPXReceiver {
             warn!("did not have a bg thread join handle, cannot join!");
         }
         self.status = ReceiverStatus::Closed;
+    }
+}
+
+struct TXPBackgroundThread {
+    bg_thread: JoinHandle<()>,
+    to_thread: Sender<TPXControlMsg>,
+    from_thread: Receiver<TPXReceiverMsg>,
+    pub status: ReceiverStatus,
+    pub shm_handle: SHMHandle,
+}
+
+impl BackgroundThread for TXPBackgroundThread {
+    type FrameMetaImpl = TPXFrameMeta;
+
+    type AcquisitionConfigImpl = AcquisitionStart;
+
+    type ExtraControl = ();
+
+    fn channel_to_thread(
+        &mut self,
+    ) -> &mut std::sync::mpsc::Sender<common::background_thread::ControlMsg<Self::ExtraControl>>
+    {
+        &mut self.to_thread
+    }
+
+    fn channel_from_thread(
+        &mut self,
+    ) -> &mut std::sync::mpsc::Receiver<
+        common::background_thread::ReceiverMsg<Self::FrameMetaImpl, Self::AcquisitionConfigImpl>,
+    > {
+        &mut self.from_thread
+    }
+
+    fn join(self) {
+        if let Err(e) = self.bg_thread.join() {
+            // FIXME: should we have an error boundary here instead and stop the panic?
+            std::panic::resume_unwind(e)
+        }
+    }
+}
+
+pub struct TPXConnection {
+    _inner: GenericConnection<TXPBackgroundThread, AcquisitionStart>,
+}
+
+impl TPXConnection {
+    fn new() -> Self {
+        Self {
+            _inner: GenericConnection::new(bg_thread, shm),
+        }
     }
 }
