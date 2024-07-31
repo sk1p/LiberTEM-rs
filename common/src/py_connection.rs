@@ -21,6 +21,7 @@ macro_rules! impl_py_connection {
                 frame_stack::{FrameMeta, FrameStackHandle},
                 generic_cam_client::GenericCamClient,
                 generic_connection::{ConnectionStatus, GenericConnection},
+                zarr_writer::ZarrWriter,
             };
             use ipc_test::SharedSlabAllocator;
             use num::NumCast;
@@ -35,6 +36,7 @@ macro_rules! impl_py_connection {
                 types::{PyBytes, PyType},
             };
             use stats::Stats;
+            use std::path::Path;
             use std::time::Duration;
             use zerocopy::{AsBytes, FromBytes};
 
@@ -220,6 +222,8 @@ macro_rules! impl_py_connection {
                     py: Python<'_>,
                 ) -> PyResult<()> {
                     let timeout = timeout.map(Duration::from_secs_f32);
+
+                    ZarrWriter::init(Path::new("/cachedata/alex/bleh-zarr/"), "/array").unwrap();
 
                     py.allow_threads(|| {
                         let conn_impl = self.get_conn_mut()?;

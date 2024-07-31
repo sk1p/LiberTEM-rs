@@ -154,9 +154,9 @@ struct CamClient {
 #[pymethods]
 impl CamClient {
     #[new]
-    fn new(handle_path: &str) -> PyResult<Self> {
+    fn new(handle_path: &str, indices: Vec<u64>) -> PyResult<Self> {
         Ok(Self {
-            inner: _PyQdCamClient::new(handle_path)?,
+            inner: _PyQdCamClient::new(handle_path, indices)?,
         })
     }
 

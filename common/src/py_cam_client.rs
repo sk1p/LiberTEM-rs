@@ -37,6 +37,7 @@ macro_rules! impl_py_cam_client {
                 decoder::{Decoder, DecoderTargetPixelType},
                 frame_stack::FrameStackHandle,
                 generic_cam_client::GenericCamClient,
+                zarr_writer::ZarrChunkWriter,
             };
             use ipc_test::SharedSlabAllocator;
             use num::{
@@ -49,6 +50,7 @@ macro_rules! impl_py_cam_client {
                 PyUntypedArray, PyUntypedArrayMethods,
             };
             use pyo3::{create_exception, exceptions::PyException, prelude::*};
+            use std::path::Path;
             use zerocopy::{AsBytes, FromBytes};
 
             create_exception!($mod, PyCamClientError, PyException);
@@ -95,11 +97,22 @@ macro_rules! impl_py_cam_client {
             #[pymethods]
             impl $name {
                 #[new]
-                pub fn new(handle_path: &str) -> PyResult<Self> {
-                    Ok(Self {
-                        client_impl: GenericCamClient::new(handle_path)
-                            .map_err(|e| PyCamClientError::new_err(e.to_string()))?,
-                    })
+                pub fn new(handle_path: &str, indices: Vec<u64>) -> PyResult<Self> {
+                    let mut client_impl = GenericCamClient::new(handle_path)
+                        .map_err(|e| PyCamClientError::new_err(e.to_string()))?;
+                    let zarr_writer: ZarrChunkWriter<
+                        u16,
+                        super::$decoder_type,
+                        super::$frame_meta_type,
+                    > = ZarrChunkWriter::new(
+                        &indices, // FIXME: where do we really get this from?
+                        Path::new("/cachedata/alex/bleh-zarr/"),
+                        "/array",
+                    );
+                    client_impl
+                        .register_consumer(Box::new(zarr_writer))
+                        .unwrap();
+                    Ok(Self { client_impl })
                 }
 
                 /// Decode into a pre-allocated array.

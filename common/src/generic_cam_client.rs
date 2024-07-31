@@ -6,6 +6,7 @@ use ndarray::ArrayViewMut3;
 use num::cast::AsPrimitive;
 
 use crate::{
+    consumer::Consumer,
     decoder::{Decoder, DecoderError, DecoderTargetPixelType},
     frame_stack::{FrameMeta, FrameStackHandle},
 };
@@ -34,6 +35,7 @@ where
 {
     shm: Option<SharedSlabAllocator>,
     decoder: D,
+    consumers: Vec<Box<dyn Consumer<Decoder = D, FrameMeta = D::FrameMeta>>>,
 }
 
 #[multiversion(targets(
@@ -71,6 +73,7 @@ where
             Ok(shm) => Ok(Self {
                 shm: Some(shm),
                 decoder: Default::default(),
+                consumers: Vec::with_capacity(4),
             }),
             Err(e) => Err(CamClientError::ConnectError {
                 handle_path: handle_path.to_owned(),
@@ -159,18 +162,50 @@ where
         decode_multi_version(&self.decoder, shm, input, dest, start_idx, end_idx)
     }
 
+    pub fn register_consumer(
+        &mut self,
+        consumer: Box<dyn Consumer<Decoder = D, FrameMeta = D::FrameMeta>>,
+    ) -> Result<(), CamClientError> {
+        self.consumers.push(consumer);
+        Ok(())
+    }
+
+    /// If there are downstream data consumers registered, let them borrow the
+    /// decoded data for a bit, before we return control to the caller.
+    fn forward(&mut self, input: &FrameStackHandle<D::FrameMeta>) -> Result<(), CamClientError> {
+        // this could potentially be asynchronous and perform writing in the
+        // background; that complicates things a bit, though, regarding pinning
+        // etc. so something for the future.
+        let shm = self.shm.take().unwrap();
+        for consumer in self.consumers.iter_mut() {
+            consumer
+                .consume_frame_stack(input, &self.decoder, &shm)
+                .unwrap(); // FIXME: don't crash; put back the `shm``
+        }
+        self.shm = Some(shm);
+        Ok(())
+    }
+
     /// Free the given `FrameStackHandle`. When calling this, no Python objects
     /// may have references to the memory of the `handle`.
-    pub fn frame_stack_done<M>(&mut self, handle: FrameStackHandle<M>) -> Result<(), CamClientError>
-    where
-        M: FrameMeta,
-    {
+    pub fn frame_stack_done(
+        &mut self,
+        handle: FrameStackHandle<D::FrameMeta>,
+    ) -> Result<(), CamClientError> {
+        self.forward(&handle)?; // FIXME: free in case of error?
         let shm = self.get_shm_mut()?;
         handle.free_slot(shm);
         Ok(())
     }
 
+    pub fn finalize_consumers(&mut self) {
+        for consumer in self.consumers.iter_mut() {
+            consumer.finalize().unwrap(); // FIXME: don't crash
+        }
+    }
+
     pub fn close(&mut self) -> Result<(), CamClientError> {
+        self.finalize_consumers();
         self.shm.take();
         Ok(())
     }
