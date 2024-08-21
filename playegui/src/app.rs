@@ -11,11 +11,9 @@ use std::{
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use eframe::epaint::ahash::HashSet;
-use egui::{
-    plot::{Corner, HLine, Legend, MarkerShape, Plot, PlotImage, PlotPoint, Points, Polygon},
-    vec2, ColorImage, TextureHandle, TextureOptions, Ui,
-};
+use egui::{vec2, Color32, ColorImage, TextureHandle, TextureOptions, Ui, ViewportCommand};
 use egui_extras::RetainedImage;
+use egui_plot::{Corner, HLine, Legend, MarkerShape, Plot, PlotImage, PlotPoint, Points, Polygon};
 use log::trace;
 use ndarray::Array2;
 
@@ -311,6 +309,7 @@ impl TemplateApp {
                         let tex_options: TextureOptions = TextureOptions {
                             magnification: egui::TextureFilter::Nearest,
                             minification: egui::TextureFilter::Linear,
+                            wrap_mode: egui::TextureWrapMode::ClampToEdge,
                         };
                         ui.ctx().load_texture(format!("{id:?}"), img, tex_options)
                     }
@@ -342,7 +341,7 @@ impl eframe::App for TemplateApp {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Quit").clicked() {
-                        frame.close();
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
                 });
             });
@@ -476,7 +475,7 @@ impl eframe::App for TemplateApp {
                     plot_cy,
                     self.ring_params.ri as f64 / 516.0,
                 ))
-                .fill_alpha(0.0);
+                .fill_color(Color32::TRANSPARENT);
                 plot_ui.polygon(polygon);
 
                 let polygon: Polygon = Polygon::new(circle_points(
@@ -484,7 +483,7 @@ impl eframe::App for TemplateApp {
                     plot_cy,
                     self.ring_params.ro as f64 / 516.0,
                 ))
-                .fill_alpha(0.0);
+                .fill_color(Color32::TRANSPARENT);
                 plot_ui.polygon(polygon);
 
                 plot_ui.points(marker);

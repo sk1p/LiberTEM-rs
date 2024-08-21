@@ -29,6 +29,7 @@ encoding_rs = { version = "0.8.34", features = [] }
 itertools = "0.13.0"
 rand = "0.8.5"
 criterion = "0.5.1"
+jemallocator = {version = "0.5.4", features = ["disable_initial_exec_tls"]}
 
 [features]
 extension-module = ["pyo3/extension-module"]

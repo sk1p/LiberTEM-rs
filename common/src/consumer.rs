@@ -65,6 +65,10 @@ mod test {
             fn get_shape(&self) -> (u64, u64) {
                 todo!()
             }
+
+            fn get_index(&self) -> usize {
+                todo!()
+            }
         }
 
         #[derive(Default)]

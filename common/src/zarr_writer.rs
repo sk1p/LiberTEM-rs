@@ -9,13 +9,17 @@ use zarrs::{
         ArrayBuilder, FillValue,
     },
     group::GroupBuilder,
-    storage::{store, ReadableWritableListableStorage},
+    storage::{
+        ReadableListableStorageTraits, ReadableWritableListableStorage,
+        ReadableWritableListableStorageTraits,
+    },
 };
 
 use crate::{
     consumer::{Consumer, ConsumerError},
     decoder::{Decoder, DecoderTargetPixelType},
     frame_stack::{FrameMeta, FrameStackHandle},
+    zarr_dio::FilesystemStoreDIO,
 };
 
 pub struct ZarrWriter {}
@@ -23,42 +27,85 @@ pub struct ZarrWriter {}
 impl ZarrWriter {
     pub fn init(save_path: &Path, array_path: &str) -> Result<(), ConsumerError> {
         let store: ReadableWritableListableStorage =
-            Arc::new(store::FilesystemStore::new(save_path).unwrap());
+            Arc::new(FilesystemStoreDIO::new(save_path).unwrap());
 
         let group = GroupBuilder::new().build(Arc::clone(&store), "/group")?;
         group.store_metadata()?;
 
-        let shard_shape = vec![128, 512, 512];
+        let shard_shape = vec![16, 512, 512];
         let inner_chunk_shape = vec![1, 512, 512];
 
-        if false {
-            let mut sharding_codec_builder =
-                ShardingCodecBuilder::new(inner_chunk_shape.as_slice().try_into()?);
-            sharding_codec_builder.bytes_to_bytes_codecs(vec![Box::new(ZstdCodec::new(5, true))]);
+        enum WriteMode {
+            ShardedNoCompression,
+            ShardedZstd,
+            Zstd,
+            Plain,
+        }
 
-            let array = ArrayBuilder::new(
-                vec![65536, 512, 512],
-                zarrs::array::DataType::UInt16,
-                shard_shape.try_into().unwrap(),
-                FillValue::from(0u16),
-            )
-            .array_to_bytes_codec(Box::new(sharding_codec_builder.build()))
-            .dimension_names(["i", "Ky", "Kx"].into())
-            .build(Arc::clone(&store), array_path)?;
+        let mode = WriteMode::Plain;
 
-            array.store_metadata()?;
-        } else {
-            let array = ArrayBuilder::new(
-                vec![65536, 512, 512],
-                zarrs::array::DataType::UInt16,
-                shard_shape.try_into().unwrap(),
-                FillValue::from(0u16),
-            )
-            // .array_to_bytes_codec(vec![])
-            .dimension_names(["i", "Ky", "Kx"].into())
-            .build(Arc::clone(&store), array_path)?;
+        match mode {
+            WriteMode::ShardedNoCompression => {
+                let mut sharding_codec_builder =
+                    ShardingCodecBuilder::new(inner_chunk_shape.as_slice().try_into()?);
+                sharding_codec_builder.bytes_to_bytes_codecs(vec![]);
 
-            array.store_metadata()?;
+                let array = ArrayBuilder::new(
+                    vec![65536, 512, 512],
+                    zarrs::array::DataType::UInt16,
+                    shard_shape.try_into().unwrap(),
+                    FillValue::from(0u16),
+                )
+                .array_to_bytes_codec(Box::new(sharding_codec_builder.build()))
+                .dimension_names(["i", "Ky", "Kx"].into())
+                .build(Arc::clone(&store), array_path)?;
+
+                array.store_metadata()?;
+            }
+            WriteMode::ShardedZstd => {
+                let mut sharding_codec_builder =
+                    ShardingCodecBuilder::new(inner_chunk_shape.as_slice().try_into()?);
+                sharding_codec_builder
+                    .bytes_to_bytes_codecs(vec![Box::new(ZstdCodec::new(1, true))]);
+
+                let array = ArrayBuilder::new(
+                    vec![65536, 512, 512],
+                    zarrs::array::DataType::UInt16,
+                    shard_shape.try_into().unwrap(),
+                    FillValue::from(0u16),
+                )
+                .array_to_bytes_codec(Box::new(sharding_codec_builder.build()))
+                .dimension_names(["i", "Ky", "Kx"].into())
+                .build(Arc::clone(&store), array_path)?;
+
+                array.store_metadata()?;
+            }
+            WriteMode::Plain => {
+                let array = ArrayBuilder::new(
+                    vec![65536, 512, 512],
+                    zarrs::array::DataType::UInt16,
+                    shard_shape.try_into().unwrap(),
+                    FillValue::from(0u16),
+                )
+                // .array_to_bytes_codec(vec![])
+                .dimension_names(["i", "Ky", "Kx"].into())
+                .build(Arc::clone(&store), array_path)?;
+
+                array.store_metadata()?;
+            }
+            WriteMode::Zstd => {
+                let array = ArrayBuilder::new(
+                    vec![65536, 512, 512],
+                    zarrs::array::DataType::UInt16,
+                    shard_shape.try_into().unwrap(),
+                    FillValue::from(0u16),
+                )
+                .bytes_to_bytes_codecs(vec![Box::new(ZstdCodec::new(1, true))])
+                .dimension_names(["i", "Ky", "Kx"].into())
+                .build(Arc::clone(&store), array_path)?;
+
+                array.store_metadata()?;
+            }
         }
 
         debug!("array metadata stored");
@@ -77,11 +124,11 @@ where
     D: Decoder + Send + Sync,
     M: FrameMeta + Send + Sync,
 {
-    buffer: Array3<T>,
+    buffer: Option<Array3<T>>,
     store: ReadableWritableListableStorage,
     cursor: usize,
     array_path: String,
-    chunk_indices: Vec<u64>,
+    arr: zarrs::array::Array<dyn ReadableWritableListableStorageTraits>,
     _d: PhantomData<D>,
     _m: PhantomData<M>,
 }
@@ -94,34 +141,38 @@ where
     D: Decoder + Send + Sync,
     M: FrameMeta + Send + Sync,
 {
-    pub fn new(partition_chunk_indices: &[u64], save_path: &Path, array_path: &str) -> Self {
+    pub fn new(save_path: &Path, array_path: &str) -> Self {
         let store: ReadableWritableListableStorage =
-            Arc::new(store::FilesystemStore::new(save_path).unwrap());
+            Arc::new(FilesystemStoreDIO::new(save_path).unwrap());
         let arr = zarrs::array::Array::open(Arc::clone(&store), array_path).unwrap();
         let chunk_grid = arr.chunk_grid();
-        let chunk_shape: Vec<std::num::NonZero<u64>> = chunk_grid
-            .chunk_shape(partition_chunk_indices, arr.shape())
-            .unwrap()
-            .unwrap()
-            .to_vec();
-        assert!(chunk_shape.len() == 3);
+        // let chunk_shape: Vec<std::num::NonZero<u64>> = chunk_grid
+        //     .chunk_shape(partition_chunk_indices, arr.shape())
+        //     .unwrap()
+        //     .unwrap()
+        //     .to_vec();
+        // assert!(chunk_shape.len() == 3);
 
         // FIXME: ok, so allocating a partition-sized buffer here is
-        // understandably quite costly, and
+        // understandably quite costly, and should be avoided. what's the best
+        // alternative?
+
+        let arr = zarrs::array::Array::open(Arc::clone(&store), &array_path).unwrap();
 
         Self {
+            arr,
             store,
-            buffer: Array3::from_shape_simple_fn(
-                [
-                    chunk_shape[0].get() as usize,
-                    chunk_shape[1].get() as usize,
-                    chunk_shape[2].get() as usize,
-                ],
-                || <T as num::Zero>::zero(),
-            ),
+            buffer: None,
+            // buffer: Array3::from_shape_simple_fn(
+            //     [
+            //         chunk_shape[0].get() as usize,
+            //         chunk_shape[1].get() as usize,
+            //         chunk_shape[2].get() as usize,
+            //     ],
+            //     || <T as num::Zero>::zero(),
+            // ),
             cursor: 0,
             array_path: array_path.to_owned(),
-            chunk_indices: Vec::from(partition_chunk_indices),
             _d: Default::default(),
             _m: Default::default(),
         }
@@ -143,10 +194,24 @@ where
         shm: &ipc_test::SharedSlabAllocator,
     ) -> Result<(), ConsumerError> {
         let len: usize = handle.len();
-        let mut view = self.buffer.view_mut();
-        let mut output = view.slice_axis_mut(Axis(0), Slice::from(self.cursor..self.cursor + len));
+        let shape = handle.first_meta().get_shape();
+
+        // FIXME: if len != chunk size, we need to do something special
+        assert_eq!(len, 16);
+        let mut buffer =
+            Array3::from_shape_simple_fn([len, shape.0 as usize, shape.1 as usize], || {
+                <T as num::Zero>::zero()
+            });
+        let mut view = buffer.view_mut();
+        let mut output = view.slice_axis_mut(Axis(0), Slice::from(0..len));
         decoder.decode(shm, handle, &mut output, 0, len).unwrap();
-        self.cursor += len;
+        let elements = buffer.as_slice().unwrap();
+
+        let chunk_indices = [(handle.first_meta().get_index() / len) as u64, 0u64, 0u64];
+
+        self.arr
+            .store_chunk_elements(&chunk_indices, elements)
+            .unwrap();
         Ok(())
     }
 
@@ -154,11 +219,6 @@ where
     type FrameMeta = M;
 
     fn finalize(&mut self) -> Result<(), ConsumerError> {
-        let arr = zarrs::array::Array::open(Arc::clone(&self.store), &self.array_path)?;
-        let elements = self.buffer.as_slice().unwrap();
-        arr.store_chunk_elements(&self.chunk_indices, elements)
-            .unwrap();
-
         Ok(())
     }
 }

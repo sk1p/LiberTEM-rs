@@ -13,6 +13,11 @@ use crate::base_types::{QdAcquisitionConfig, QdDetectorConnConfig, QdFrameMeta, 
 use crate::decoder::QdDecoder;
 use crate::{background_thread::QdBackgroundThread, base_types::QdAcquisitionHeader};
 
+use jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[pymodule]
 fn libertem_qd_mpx(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<QdConnection>()?;
@@ -63,7 +68,7 @@ impl QdConnection {
         // NOTE: these values don't have to be exact and are mostly important
         // for performance tuning
         let num_slots = num_slots.unwrap_or(2000);
-        let bytes_per_frame = bytes_per_frame.unwrap_or(256 * 256 * 2);
+        let bytes_per_frame = bytes_per_frame.unwrap_or(512 * 512 * 2);
 
         let drain = if drain.unwrap_or(false) {
             Some(Duration::from_millis(100))
@@ -154,9 +159,9 @@ struct CamClient {
 #[pymethods]
 impl CamClient {
     #[new]
-    fn new(handle_path: &str, indices: Vec<u64>) -> PyResult<Self> {
+    fn new(handle_path: &str) -> PyResult<Self> {
         Ok(Self {
-            inner: _PyQdCamClient::new(handle_path, indices)?,
+            inner: _PyQdCamClient::new(handle_path)?,
         })
     }
 

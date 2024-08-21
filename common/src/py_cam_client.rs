@@ -97,18 +97,14 @@ macro_rules! impl_py_cam_client {
             #[pymethods]
             impl $name {
                 #[new]
-                pub fn new(handle_path: &str, indices: Vec<u64>) -> PyResult<Self> {
+                pub fn new(handle_path: &str) -> PyResult<Self> {
                     let mut client_impl = GenericCamClient::new(handle_path)
                         .map_err(|e| PyCamClientError::new_err(e.to_string()))?;
                     let zarr_writer: ZarrChunkWriter<
                         u16,
                         super::$decoder_type,
                         super::$frame_meta_type,
-                    > = ZarrChunkWriter::new(
-                        &indices, // FIXME: where do we really get this from?
-                        Path::new("/cachedata/alex/bleh-zarr/"),
-                        "/array",
-                    );
+                    > = ZarrChunkWriter::new(Path::new("/cachedata/alex/bleh-zarr/"), "/array");
                     client_impl
                         .register_consumer(Box::new(zarr_writer))
                         .unwrap();

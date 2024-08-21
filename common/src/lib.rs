@@ -8,4 +8,5 @@ pub mod py_cam_client;
 pub mod py_connection;
 pub mod tcp;
 pub mod utils;
+pub mod zarr_dio;
 pub mod zarr_writer;

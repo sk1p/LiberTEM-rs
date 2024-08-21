@@ -482,6 +482,10 @@ impl FrameMeta for QdFrameMeta {
     fn get_shape(&self) -> (u64, u64) {
         (self.width_in_pixels as u64, self.height_in_pixels as u64)
     }
+
+    fn get_index(&self) -> usize {
+        self.get_sequence() as usize - 1
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -681,7 +685,8 @@ pub struct QdDetectorConnConfig {
     pub data_host: String,
     pub data_port: usize,
 
-    /// number of frames per frame stack; approximated because of compression
+    /// number of frames per frame stack; approximated because of
+    /// compression/encoding
     pub frame_stack_size: usize,
 
     /// approx. number of bytes per frame, used for sizing frame stacks together

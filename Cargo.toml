@@ -8,7 +8,9 @@ members = [
     "playegui",
     "bs-sys",
     "stats",
-    "serval-client", "common",
+    "serval-client",
+    "common",
+    "zarrs",
 ]
 resolver = "2"
 
