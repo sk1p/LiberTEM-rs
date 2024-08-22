@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, path::Path, sync::Arc};
+use std::{cell::RefCell, marker::PhantomData, path::Path, sync::Arc};
 
 use log::debug;
 use ndarray::{Array3, Axis, Slice};
@@ -125,9 +125,6 @@ where
     M: FrameMeta + Send + Sync,
 {
     buffer: Option<Array3<T>>,
-    store: ReadableWritableListableStorage,
-    cursor: usize,
-    array_path: String,
     arr: zarrs::array::Array<dyn ReadableWritableListableStorageTraits>,
     _d: PhantomData<D>,
     _m: PhantomData<M>,
@@ -145,34 +142,9 @@ where
         let store: ReadableWritableListableStorage =
             Arc::new(FilesystemStoreDIO::new(save_path).unwrap());
         let arr = zarrs::array::Array::open(Arc::clone(&store), array_path).unwrap();
-        let chunk_grid = arr.chunk_grid();
-        // let chunk_shape: Vec<std::num::NonZero<u64>> = chunk_grid
-        //     .chunk_shape(partition_chunk_indices, arr.shape())
-        //     .unwrap()
-        //     .unwrap()
-        //     .to_vec();
-        // assert!(chunk_shape.len() == 3);
-
-        // FIXME: ok, so allocating a partition-sized buffer here is
-        // understandably quite costly, and should be avoided. what's the best
-        // alternative?
-
-        let arr = zarrs::array::Array::open(Arc::clone(&store), &array_path).unwrap();
-
         Self {
             arr,
-            store,
             buffer: None,
-            // buffer: Array3::from_shape_simple_fn(
-            //     [
-            //         chunk_shape[0].get() as usize,
-            //         chunk_shape[1].get() as usize,
-            //         chunk_shape[2].get() as usize,
-            //     ],
-            //     || <T as num::Zero>::zero(),
-            // ),
-            cursor: 0,
-            array_path: array_path.to_owned(),
             _d: Default::default(),
             _m: Default::default(),
         }
@@ -196,22 +168,34 @@ where
         let len: usize = handle.len();
         let shape = handle.first_meta().get_shape();
 
-        // FIXME: if len != chunk size, we need to do something special
-        assert_eq!(len, 16);
-        let mut buffer =
-            Array3::from_shape_simple_fn([len, shape.0 as usize, shape.1 as usize], || {
+        let mut buffer = match self.buffer.take() {
+            None => Array3::from_shape_simple_fn([len, shape.0 as usize, shape.1 as usize], || {
                 <T as num::Zero>::zero()
-            });
+            }),
+            Some(existing) => {
+                if existing.shape().first().unwrap() < &len {
+                    Array3::from_shape_simple_fn([len, shape.0 as usize, shape.1 as usize], || {
+                        <T as num::Zero>::zero()
+                    })
+                } else {
+                    existing
+                }
+            }
+        };
+
+        // FIXME: if len != chunk size, we need to buffer
+        assert_eq!(len, 16);
         let mut view = buffer.view_mut();
         let mut output = view.slice_axis_mut(Axis(0), Slice::from(0..len));
         decoder.decode(shm, handle, &mut output, 0, len).unwrap();
-        let elements = buffer.as_slice().unwrap();
+        let elements = output.as_slice().unwrap();
 
         let chunk_indices = [(handle.first_meta().get_index() / len) as u64, 0u64, 0u64];
 
         self.arr
             .store_chunk_elements(&chunk_indices, elements)
             .unwrap();
+        self.buffer = Some(buffer);
         Ok(())
     }
 
