@@ -1,7 +1,10 @@
-use std::{cell::RefCell, marker::PhantomData, path::Path, sync::Arc};
+use std::{
+    cell::RefCell, collections::HashMap, fs::OpenOptions, io::Write, marker::PhantomData, mem::size_of, os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}, sync::{Arc, Mutex, RwLock}
+};
 
 use log::debug;
-use ndarray::{Array3, Axis, Slice};
+use ndarray::{ArrayViewMut, Axis, Slice};
+use nix::libc::O_DIRECT;
 use num::cast::AsPrimitive;
 use zarrs::{
     array::{
@@ -10,8 +13,7 @@ use zarrs::{
     },
     group::GroupBuilder,
     storage::{
-        ReadableListableStorageTraits, ReadableWritableListableStorage,
-        ReadableWritableListableStorageTraits,
+        data_key, ReadableWritableListableStorage, ReadableWritableListableStorageTraits, StoreKey,
     },
 };
 
@@ -19,7 +21,7 @@ use crate::{
     consumer::{Consumer, ConsumerError},
     decoder::{Decoder, DecoderTargetPixelType},
     frame_stack::{FrameMeta, FrameStackHandle},
-    zarr_dio::FilesystemStoreDIO,
+    zarr_dio::{FilesystemStoreDIO, PageAlinedBuffer},
 };
 
 pub struct ZarrWriter {}
@@ -124,10 +126,13 @@ where
     D: Decoder + Send + Sync,
     M: FrameMeta + Send + Sync,
 {
-    buffer: Option<Array3<T>>,
     arr: zarrs::array::Array<dyn ReadableWritableListableStorageTraits>,
+    store: ReadableWritableListableStorage,
+    save_path: PathBuf,
+    files: Mutex<HashMap<StoreKey, Arc<RwLock<()>>>>,
     _d: PhantomData<D>,
     _m: PhantomData<M>,
+    _t: PhantomData<T>,
 }
 
 impl<T, D, M> ZarrChunkWriter<T, D, M>
@@ -144,11 +149,18 @@ where
         let arr = zarrs::array::Array::open(Arc::clone(&store), array_path).unwrap();
         Self {
             arr,
-            buffer: None,
+            store,
+            save_path: save_path.to_owned(),
+            files: Mutex::new(HashMap::new()),
             _d: Default::default(),
             _m: Default::default(),
+            _t: Default::default(),
         }
     }
+}
+
+thread_local! {
+    pub static PAGE_ALIGNED_BUF: RefCell<PageAlinedBuffer> = RefCell::new(PageAlinedBuffer::new(8388608));
 }
 
 impl<T, D, M> Consumer for ZarrChunkWriter<T, D, M>
@@ -159,6 +171,9 @@ where
     D: Decoder<FrameMeta = M> + Send + Sync,
     M: FrameMeta + Send + Sync,
 {
+    type Decoder = D;
+    type FrameMeta = M;
+
     fn consume_frame_stack(
         &mut self,
         handle: &FrameStackHandle<M>,
@@ -168,41 +183,90 @@ where
         let len: usize = handle.len();
         let shape = handle.first_meta().get_shape();
 
-        let mut buffer = match self.buffer.take() {
-            None => Array3::from_shape_simple_fn([len, shape.0 as usize, shape.1 as usize], || {
-                <T as num::Zero>::zero()
-            }),
-            Some(existing) => {
-                if existing.shape().first().unwrap() < &len {
-                    Array3::from_shape_simple_fn([len, shape.0 as usize, shape.1 as usize], || {
-                        <T as num::Zero>::zero()
-                    })
-                } else {
-                    existing
+        PAGE_ALIGNED_BUF.with_borrow_mut(|buf| {
+            // FIXME: if len != chunk size, we need to buffer
+            assert_eq!(len, 16);
+
+            let buf_t = T::mut_slice_from(buf).unwrap();
+
+            let mut view =
+                ArrayViewMut::from_shape([len, shape.0 as usize, shape.1 as usize], buf_t)
+                    .unwrap();
+            let mut output = view.slice_axis_mut(Axis(0), Slice::from(0..len));
+            decoder.decode(shm, handle, &mut output, 0, len).unwrap();
+            let chunk_indices = [(handle.first_meta().get_index() / len) as u64, 0u64, 0u64];
+            let key = data_key(
+                self.arr.path(),
+                &chunk_indices,
+                self.arr.chunk_key_encoding(),
+            );
+
+            let file = self.get_file_mutex(&key);
+            let _lock = file.write();
+
+            // Create directories
+            let key_path = self.key_to_fspath(&key);
+            if let Some(parent) = key_path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent).unwrap();
                 }
             }
-        };
 
-        // FIXME: if len != chunk size, we need to buffer
-        assert_eq!(len, 16);
-        let mut view = buffer.view_mut();
-        let mut output = view.slice_axis_mut(Axis(0), Slice::from(0..len));
-        decoder.decode(shm, handle, &mut output, 0, len).unwrap();
-        let elements = output.as_slice().unwrap();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(O_DIRECT)
+                .open(key_path)
+                .unwrap();
 
-        let chunk_indices = [(handle.first_meta().get_index() / len) as u64, 0u64, 0u64];
+            let cutoff = shape.0 * shape.1 * len as u64 * size_of::<T>() as u64;
+            let align = page_size::get() as u64;
+            let pad_size = (align - (cutoff % align)) % align;
+            let aligned_cutoff = (cutoff + pad_size) as usize;
 
-        self.arr
-            .store_chunk_elements(&chunk_indices, elements)
-            .unwrap();
-        self.buffer = Some(buffer);
+            assert!(aligned_cutoff >= cutoff as usize);
+            assert!(aligned_cutoff % align as usize == 0);
+
+            // Write
+            file.write_all(&buf[0..aligned_cutoff]).unwrap();
+
+            // we may have written more because of page-size alignment; truncate.
+            file.set_len(cutoff).unwrap();
+        });
+
         Ok(())
     }
-
-    type Decoder = D;
-    type FrameMeta = M;
 
     fn finalize(&mut self) -> Result<(), ConsumerError> {
         Ok(())
     }
+}
+
+impl<T, D, M> ZarrChunkWriter<T, D, M>
+where
+    T: DecoderTargetPixelType + Send + Sync + zarrs::array::Element,
+    u8: AsPrimitive<T>,
+    u16: AsPrimitive<T>,
+    D: Decoder<FrameMeta = M> + Send + Sync,
+    M: FrameMeta + Send + Sync,
+{
+    pub fn key_to_fspath(&self, key: &StoreKey) -> PathBuf {
+        let mut path = self.save_path.clone();
+        if !key.as_str().is_empty() {
+            path.push(key.as_str().strip_prefix('/').unwrap_or(key.as_str()));
+        }
+        path
+    }
+
+    pub fn get_file_mutex(&self, key: &StoreKey) -> Arc<RwLock<()>> {
+        let mut files = self.files.lock().unwrap();
+        let file = files
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(RwLock::default()))
+            .clone();
+        drop(files);
+        file
+    }
+
 }

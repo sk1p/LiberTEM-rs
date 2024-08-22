@@ -50,13 +50,13 @@ use std::{
 //     FilesystemStore::new(path).map_err(|e| StorePluginCreateError::Other(e.to_string()))
 // }
 
-struct PageAlinedBuffer {
+pub struct PageAlinedBuffer {
     buf: *mut u8,
     layout: Layout,
 }
 
 impl PageAlinedBuffer {
-    fn new(size: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         let align = page_size::get();
         let pad_size = (align - (size % align)) % align;
         let padded_size = size + pad_size;
@@ -205,7 +205,7 @@ impl FilesystemStoreDIO {
         path
     }
 
-    fn get_file_mutex(&self, key: &StoreKey) -> Arc<RwLock<()>> {
+    pub fn get_file_mutex(&self, key: &StoreKey) -> Arc<RwLock<()>> {
         let mut files = self.files.lock().unwrap();
         let file = files
             .entry(key.clone())
