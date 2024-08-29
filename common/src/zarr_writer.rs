@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     iter,
     marker::PhantomData,
@@ -139,6 +138,7 @@ where
     store: ReadableWritableListableStorage,
     save_path: PathBuf,
     files: Mutex<HashMap<StoreKey, Arc<RwLock<()>>>>,
+    chunk_buf: Option<BytesMut>,
     _d: PhantomData<D>,
     _m: PhantomData<M>,
     _t: PhantomData<T>,
@@ -163,6 +163,7 @@ where
             store,
             save_path: save_path.to_owned(),
             files: Mutex::new(HashMap::new()),
+            chunk_buf: None,
             _d: Default::default(),
             _m: Default::default(),
             _t: Default::default(),
@@ -175,10 +176,6 @@ fn bytes_aligned(size: usize) -> BytesMut {
     let mut bytes = BytesMut::with_capacity(size + 2 * align);
     let offset = bytes.as_ptr().align_offset(align);
     bytes.split_off(offset)
-}
-
-thread_local! {
-    pub static PAGE_ALIGNED_BUF: RefCell<BytesMut> = RefCell::new(bytes_aligned(0));
 }
 
 impl<T, D, M> Consumer for ZarrChunkWriter<T, D, M>
@@ -201,18 +198,23 @@ where
         let len: usize = handle.len();
         let shape = handle.first_meta().get_shape();
 
-        let buf = PAGE_ALIGNED_BUF.take();
-
         // FIXME: if len != chunk size, we need to buffer
         assert_eq!(len, 16);
 
+        let buf = self.chunk_buf.take();
         let size_bytes = len * (shape.0 * shape.1) as usize * size_of::<u16>();
 
-        let mut buf = if buf.len() < size_bytes {
+        let mut buf = if let Some(buf) = buf {
+            if buf.len() < size_bytes {
+                let mut buf = bytes_aligned(size_bytes);
+                buf.extend(iter::repeat(0).take(size_bytes));
+                buf
+            } else {
+                buf
+            }
+        } else {
             let mut buf = bytes_aligned(size_bytes);
             buf.extend(iter::repeat(0).take(size_bytes));
-            buf
-        } else {
             buf
         };
 
@@ -230,9 +232,11 @@ where
                 .store_encoded_chunk(&chunk_indices, buf_frozen.clone())
                 .unwrap();
         }
-        buf = buf_frozen.try_into_mut().unwrap(); // FIXME: handle the case where the buffer is still in use?
+        buf = buf_frozen
+            .try_into_mut()
+            .expect("we are the only user of this buffer");
 
-        PAGE_ALIGNED_BUF.replace(buf);
+        self.chunk_buf = Some(buf);
 
         Ok(())
     }
