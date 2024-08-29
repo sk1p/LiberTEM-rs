@@ -42,9 +42,16 @@ impl DType {
 
 #[derive(PartialEq, Eq, Clone, Serialize, Deserialize, Debug)]
 pub struct ASIMpxFrameMeta {
+    /// zero-based index of the frame in the acquisition
     pub sequence: u64,
+
+    /// pixel dtype
     pub dtype: DType,
+
+    /// width of the frame in pixels
     pub width: u16,
+
+    /// height of the frame in pixels
     pub height: u16,
 
     /// The exact length of the data for this frame
@@ -72,6 +79,10 @@ impl FrameMeta for ASIMpxFrameMeta {
 
     fn get_shape(&self) -> (u64, u64) {
         (self.width as u64, self.height as u64)
+    }
+
+    fn get_index(&self) -> usize {
+        self.sequence as usize
     }
 }
 

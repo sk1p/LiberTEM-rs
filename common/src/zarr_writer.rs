@@ -1,10 +1,16 @@
 use std::{
-    cell::RefCell, collections::HashMap, fs::OpenOptions, io::Write, marker::PhantomData, mem::size_of, os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}, sync::{Arc, Mutex, RwLock}
+    cell::RefCell,
+    collections::HashMap,
+    iter,
+    marker::PhantomData,
+    mem::size_of,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock},
 };
 
+use bytes::BytesMut;
 use log::debug;
 use ndarray::{ArrayViewMut, Axis, Slice};
-use nix::libc::O_DIRECT;
 use num::cast::AsPrimitive;
 use zarrs::{
     array::{
@@ -13,23 +19,26 @@ use zarrs::{
     },
     group::GroupBuilder,
     storage::{
-        data_key, ReadableWritableListableStorage, ReadableWritableListableStorageTraits, StoreKey,
+        store::{FilesystemStore, FilesystemStoreOptions},
+        ReadableWritableListableStorage, ReadableWritableListableStorageTraits, StoreKey,
     },
 };
+use zerocopy::AsBytes;
 
 use crate::{
     consumer::{Consumer, ConsumerError},
     decoder::{Decoder, DecoderTargetPixelType},
     frame_stack::{FrameMeta, FrameStackHandle},
-    zarr_dio::{FilesystemStoreDIO, PageAlinedBuffer},
 };
 
 pub struct ZarrWriter {}
 
 impl ZarrWriter {
     pub fn init(save_path: &Path, array_path: &str) -> Result<(), ConsumerError> {
+        let mut opts = FilesystemStoreOptions::default();
+        opts.direct_io(true);
         let store: ReadableWritableListableStorage =
-            Arc::new(FilesystemStoreDIO::new(save_path).unwrap());
+            Arc::new(FilesystemStore::new_with_options(save_path, opts).unwrap());
 
         let group = GroupBuilder::new().build(Arc::clone(&store), "/group")?;
         group.store_metadata()?;
@@ -144,8 +153,10 @@ where
     M: FrameMeta + Send + Sync,
 {
     pub fn new(save_path: &Path, array_path: &str) -> Self {
+        let mut opts = FilesystemStoreOptions::default();
+        opts.direct_io(true);
         let store: ReadableWritableListableStorage =
-            Arc::new(FilesystemStoreDIO::new(save_path).unwrap());
+            Arc::new(FilesystemStore::new_with_options(save_path, opts).unwrap());
         let arr = zarrs::array::Array::open(Arc::clone(&store), array_path).unwrap();
         Self {
             arr,
@@ -159,8 +170,15 @@ where
     }
 }
 
+fn bytes_aligned(size: usize) -> BytesMut {
+    let align = page_size::get();
+    let mut bytes = BytesMut::with_capacity(size + 2 * align);
+    let offset = bytes.as_ptr().align_offset(align);
+    bytes.split_off(offset)
+}
+
 thread_local! {
-    pub static PAGE_ALIGNED_BUF: RefCell<PageAlinedBuffer> = RefCell::new(PageAlinedBuffer::new(8388608));
+    pub static PAGE_ALIGNED_BUF: RefCell<BytesMut> = RefCell::new(bytes_aligned(0));
 }
 
 impl<T, D, M> Consumer for ZarrChunkWriter<T, D, M>
@@ -183,57 +201,38 @@ where
         let len: usize = handle.len();
         let shape = handle.first_meta().get_shape();
 
-        PAGE_ALIGNED_BUF.with_borrow_mut(|buf| {
-            // FIXME: if len != chunk size, we need to buffer
-            assert_eq!(len, 16);
+        let buf = PAGE_ALIGNED_BUF.take();
 
-            let buf_t = T::mut_slice_from(buf).unwrap();
+        // FIXME: if len != chunk size, we need to buffer
+        assert_eq!(len, 16);
 
-            let mut view =
-                ArrayViewMut::from_shape([len, shape.0 as usize, shape.1 as usize], buf_t)
-                    .unwrap();
-            let mut output = view.slice_axis_mut(Axis(0), Slice::from(0..len));
-            decoder.decode(shm, handle, &mut output, 0, len).unwrap();
-            let chunk_indices = [(handle.first_meta().get_index() / len) as u64, 0u64, 0u64];
-            let key = data_key(
-                self.arr.path(),
-                &chunk_indices,
-                self.arr.chunk_key_encoding(),
-            );
+        let size_bytes = len * (shape.0 * shape.1) as usize * size_of::<u16>();
 
-            let file = self.get_file_mutex(&key);
-            let _lock = file.write();
+        let mut buf = if buf.len() < size_bytes {
+            let mut buf = bytes_aligned(size_bytes);
+            buf.extend(iter::repeat(0).take(size_bytes));
+            buf
+        } else {
+            buf
+        };
 
-            // Create directories
-            let key_path = self.key_to_fspath(&key);
-            if let Some(parent) = key_path.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent).unwrap();
-                }
-            }
+        let buf_t = T::mut_slice_from(buf.as_bytes_mut()).unwrap();
 
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(O_DIRECT)
-                .open(key_path)
+        let mut view =
+            ArrayViewMut::from_shape([len, shape.0 as usize, shape.1 as usize], buf_t).unwrap();
+        let mut output = view.slice_axis_mut(Axis(0), Slice::from(0..len));
+        decoder.decode(shm, handle, &mut output, 0, len).unwrap();
+        let chunk_indices = [(handle.first_meta().get_index() / len) as u64, 0u64, 0u64];
+
+        let buf_frozen = buf.freeze();
+        unsafe {
+            self.arr
+                .store_encoded_chunk(&chunk_indices, buf_frozen.clone())
                 .unwrap();
+        }
+        buf = buf_frozen.try_into_mut().unwrap(); // FIXME: handle the case where the buffer is still in use?
 
-            let cutoff = shape.0 * shape.1 * len as u64 * size_of::<T>() as u64;
-            let align = page_size::get() as u64;
-            let pad_size = (align - (cutoff % align)) % align;
-            let aligned_cutoff = (cutoff + pad_size) as usize;
-
-            assert!(aligned_cutoff >= cutoff as usize);
-            assert!(aligned_cutoff % align as usize == 0);
-
-            // Write
-            file.write_all(&buf[0..aligned_cutoff]).unwrap();
-
-            // we may have written more because of page-size alignment; truncate.
-            file.set_len(cutoff).unwrap();
-        });
+        PAGE_ALIGNED_BUF.replace(buf);
 
         Ok(())
     }
@@ -268,5 +267,4 @@ where
         drop(files);
         file
     }
-
 }

@@ -304,6 +304,10 @@ impl FrameMeta for DectrisFrameMeta {
     fn get_shape(&self) -> (u64, u64) {
         self.dimaged.shape
     }
+
+    fn get_index(&self) -> usize {
+        self.dimage.frame as usize
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

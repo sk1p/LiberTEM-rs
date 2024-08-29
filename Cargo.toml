@@ -10,7 +10,6 @@ members = [
     "stats",
     "serval-client",
     "common",
-    "zarrs",
 ]
 resolver = "2"
 
