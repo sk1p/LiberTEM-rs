@@ -11,12 +11,15 @@ use bytes::BytesMut;
 use log::debug;
 use ndarray::{ArrayViewMut, Axis, Slice};
 use num::cast::AsPrimitive;
+use serde::{Deserialize, Serialize};
 use zarrs::{
     array::{
-        codec::{array_to_bytes::sharding::ShardingCodecBuilder, ZstdCodec},
-        ArrayBuilder, FillValue,
+        codec::{
+            bytes_to_bytes::blosc::{BloscCompressionLevel, BloscCompressor},
+            BloscCodec, ZstdCodec,
+        },
+        ArrayBuilder, DataType, FillValue,
     },
-    group::GroupBuilder,
     storage::{
         store::{FilesystemStore, FilesystemStoreOptions},
         ReadableWritableListableStorage, ReadableWritableListableStorageTraits, StoreKey,
@@ -32,94 +35,66 @@ use crate::{
 
 pub struct ZarrWriter {}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ZarrCompression {
+    Blosc {
+        cname: BloscCompressor,
+        clevel: BloscCompressionLevel,
+    },
+    Zstd {
+        level: i32,
+        checksum: bool,
+    },
+}
+
 impl ZarrWriter {
-    pub fn init(save_path: &Path, array_path: &str) -> Result<(), ConsumerError> {
+    pub fn init(
+        save_path: &Path,
+        array_path: &str,
+        compression: Option<&ZarrCompression>,
+        chunk_grid: &[u64],
+        array_shape: &[u64],
+        dtype: DataType,
+        fill_value: FillValue,
+    ) -> Result<(), ConsumerError> {
         let mut opts = FilesystemStoreOptions::default();
         opts.direct_io(true);
         let store: ReadableWritableListableStorage =
             Arc::new(FilesystemStore::new_with_options(save_path, opts).unwrap());
 
-        let group = GroupBuilder::new().build(Arc::clone(&store), "/group")?;
-        group.store_metadata()?;
+        let chunk_grid = chunk_grid.to_vec();
+        let shape = array_shape.to_vec();
 
-        let shard_shape = vec![16, 512, 512];
-        let inner_chunk_shape = vec![1, 512, 512];
+        let mut builder =
+            ArrayBuilder::new(shape, dtype, chunk_grid.try_into().unwrap(), fill_value);
 
-        enum WriteMode {
-            ShardedNoCompression,
-            ShardedZstd,
-            Zstd,
-            Plain,
-        }
-
-        let mode = WriteMode::Plain;
-
-        match mode {
-            WriteMode::ShardedNoCompression => {
-                let mut sharding_codec_builder =
-                    ShardingCodecBuilder::new(inner_chunk_shape.as_slice().try_into()?);
-                sharding_codec_builder.bytes_to_bytes_codecs(vec![]);
-
-                let array = ArrayBuilder::new(
-                    vec![65536, 512, 512],
-                    zarrs::array::DataType::UInt16,
-                    shard_shape.try_into().unwrap(),
-                    FillValue::from(0u16),
-                )
-                .array_to_bytes_codec(Box::new(sharding_codec_builder.build()))
-                .dimension_names(["i", "Ky", "Kx"].into())
-                .build(Arc::clone(&store), array_path)?;
-
-                array.store_metadata()?;
+        let array = match compression {
+            None => builder.build(Arc::clone(&store), array_path)?,
+            Some(ZarrCompression::Zstd { level, checksum }) => {
+                let array = builder
+                    .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(*level, *checksum))])
+                    .build(Arc::clone(&store), array_path)?;
+                array
             }
-            WriteMode::ShardedZstd => {
-                let mut sharding_codec_builder =
-                    ShardingCodecBuilder::new(inner_chunk_shape.as_slice().try_into()?);
-                sharding_codec_builder
-                    .bytes_to_bytes_codecs(vec![Box::new(ZstdCodec::new(1, true))]);
-
-                let array = ArrayBuilder::new(
-                    vec![65536, 512, 512],
-                    zarrs::array::DataType::UInt16,
-                    shard_shape.try_into().unwrap(),
-                    FillValue::from(0u16),
-                )
-                .array_to_bytes_codec(Box::new(sharding_codec_builder.build()))
-                .dimension_names(["i", "Ky", "Kx"].into())
-                .build(Arc::clone(&store), array_path)?;
-
-                array.store_metadata()?;
+            Some(ZarrCompression::Blosc { cname, clevel }) => {
+                let array = builder
+                    .bytes_to_bytes_codecs(vec![Arc::new(
+                        BloscCodec::new(
+                            *cname,
+                            *clevel,
+                            None,
+                            zarrs::array::codec::bytes_to_bytes::blosc::BloscShuffleMode::NoShuffle,
+                            None,
+                        )
+                        .unwrap(),
+                    )])
+                    .build(Arc::clone(&store), array_path)?;
+                array
             }
-            WriteMode::Plain => {
-                let array = ArrayBuilder::new(
-                    vec![65536, 512, 512],
-                    zarrs::array::DataType::UInt16,
-                    shard_shape.try_into().unwrap(),
-                    FillValue::from(0u16),
-                )
-                // .array_to_bytes_codec(vec![])
-                .dimension_names(["i", "Ky", "Kx"].into())
-                .build(Arc::clone(&store), array_path)?;
+        };
 
-                array.store_metadata()?;
-            }
-            WriteMode::Zstd => {
-                let array = ArrayBuilder::new(
-                    vec![65536, 512, 512],
-                    zarrs::array::DataType::UInt16,
-                    shard_shape.try_into().unwrap(),
-                    FillValue::from(0u16),
-                )
-                .bytes_to_bytes_codecs(vec![Box::new(ZstdCodec::new(1, true))])
-                .dimension_names(["i", "Ky", "Kx"].into())
-                .build(Arc::clone(&store), array_path)?;
-
-                array.store_metadata()?;
-            }
-        }
-
+        array.store_metadata()?;
         debug!("array metadata stored");
-
         Ok(())
     }
 }
@@ -202,7 +177,7 @@ where
         assert_eq!(len, 16);
 
         let buf = self.chunk_buf.take();
-        let size_bytes = len * (shape.0 * shape.1) as usize * size_of::<u16>();
+        let size_bytes = len * (shape.0 * shape.1) as usize * size_of::<T>();
 
         let mut buf = if let Some(buf) = buf {
             if buf.len() < size_bytes {
@@ -254,21 +229,4 @@ where
     D: Decoder<FrameMeta = M> + Send + Sync,
     M: FrameMeta + Send + Sync,
 {
-    pub fn key_to_fspath(&self, key: &StoreKey) -> PathBuf {
-        let mut path = self.save_path.clone();
-        if !key.as_str().is_empty() {
-            path.push(key.as_str().strip_prefix('/').unwrap_or(key.as_str()));
-        }
-        path
-    }
-
-    pub fn get_file_mutex(&self, key: &StoreKey) -> Arc<RwLock<()>> {
-        let mut files = self.files.lock().unwrap();
-        let file = files
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(RwLock::default()))
-            .clone();
-        drop(files);
-        file
-    }
 }

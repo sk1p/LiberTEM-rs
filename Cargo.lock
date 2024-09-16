@@ -1082,6 +1082,7 @@ dependencies = [
  "bincode",
  "bytes",
  "criterion",
+ "half",
  "ipc-test",
  "log",
  "multiversion",
@@ -1375,12 +1376,6 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
-
-[[package]]
-name = "dyn-clone"
-version = "1.0.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d6ef0072f8a535281e4876be788938b528e9a1d43900b82c2569af7da799125"
 
 [[package]]
 name = "ecolor"
@@ -5040,6 +5035,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7de7d73e1754487cb58364ee906a499937a0dfabd86bcb980fa99ec8c8fa2ce"
 
 [[package]]
+name = "unsafe_cell_slice"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87ff1e2d9d0ab975b5536e8d6cdafdc786bd12bec7f179b8b3241f1b2bf39f6a"
+
+[[package]]
 name = "url"
 version = "2.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5995,37 +5996,62 @@ checksum = "539a77ee7c0de333dcc6da69b177380a0b81e0dacfa4f7344c465a36871ee601"
 
 [[package]]
 name = "zarrs"
-version = "0.17.0-dev"
+version = "0.17.0-beta.0"
 dependencies = [
  "blosc-src",
  "bytemuck",
  "bytes",
  "crc32c",
  "derive_more",
- "dyn-clone",
  "flate2",
  "half",
  "inventory",
  "itertools 0.13.0",
- "libc",
  "lru",
  "moka",
- "monostate",
  "ndarray",
  "num",
  "num-complex",
- "page_size 0.6.0",
- "parking_lot",
- "pathdiff",
  "rayon",
  "rayon_iter_concurrent_limit",
  "serde",
  "serde_json",
- "serde_repr",
  "thiserror",
  "thread_local",
- "walkdir",
+ "unsafe_cell_slice",
+ "zarrs_metadata",
+ "zarrs_storage",
  "zstd",
+]
+
+[[package]]
+name = "zarrs_metadata"
+version = "0.1.0"
+dependencies = [
+ "derive_more",
+ "half",
+ "monostate",
+ "num",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "thiserror",
+]
+
+[[package]]
+name = "zarrs_storage"
+version = "0.1.2"
+dependencies = [
+ "bytes",
+ "derive_more",
+ "itertools 0.13.0",
+ "libc",
+ "page_size 0.6.0",
+ "parking_lot",
+ "pathdiff",
+ "thiserror",
+ "unsafe_cell_slice",
+ "walkdir",
 ]
 
 [[package]]
